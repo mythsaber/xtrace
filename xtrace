@@ -1,0 +1,1278 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+# xtrace
+#
+# 借助ebpf技术，在不阻塞程序运行的前提下hook一个组件的
+# 帧处理函数, 打印输入/输出帧链上每一帧的属性
+#
+# 按组件规范, 帧处理函数是 (void *hdl, Antares_frame_list_handle in_framelist),
+# 第 2 个参数就是帧链, 一条链上的每一帧各打印一行。
+#
+# 插件和 libAntares 都按脚本所在目录找, 所以只要给帧处理函数名即可 ——
+# 用法和输出格式见 readme.md, 例:
+#     ./xtrace --func ff_demuxer_frame > xte.csv
+
+import argparse
+import difflib
+import glob
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+
+from bcc import BPF
+
+# 部署约定: 插件在 <脚本目录>/Plugins/ 下, libAntares 在 <脚本目录>/lib/ 下。
+# realpath 是为了处理脚本本身被软链接的情况(软链接所在目录并不可靠)。
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+PLUGIN_GLOB = os.path.join(SCRIPT_DIR, "Plugins", "*.apf.*")
+LIB_GLOB = os.path.join(SCRIPT_DIR, "lib", "libAntares.so*")
+
+# 命名约定: 各插件的帧处理函数都叫 <模块名>_frame, 插件文件叫 <模块名>.apf.<版本>。
+# --func 由它反推模块名
+FRAME_SUFFIX = "_frame"
+
+# 每次运行都把读到的枚举表写到这里, 供事后和 Antares_frame_define.h 对拍
+ENUM_DUMP_NAME = "xtrace.enum"
+ENUM_DUMP_PATH = os.path.join(SCRIPT_DIR, ENUM_DUMP_NAME)
+
+examples = """examples:
+    ./xtrace --func ff_demuxer_frame
+    ./xtrace --func ff_demuxer_frame --id INPUT_0
+    ./xtrace --func decoder_cpu_frame --ret 1
+"""
+
+# 一条帧链最多记录多少帧。受 eBPF 指令数上限限制, 不要调大: 脚本里有
+# bpf_probe_read_user -> bpf_probe_read 的低内核兼容写法, 目标内核偏老
+# (BPF_MAXINSNS = 4096, 且 5.3 之前 verifier 不支持有界循环),
+# 16 帧 *(每帧约 80~120 条指令) 约 1300~1900 条, 安全; 64 帧会 "program too large"。
+# 链更长时由 qlen 列体现, 见 print_event。
+MAX_FRAMES_PER_CALL = 16
+
+# 帧结构的成员偏移**不写死**, 每次运行时从 <脚本目录>/lib/ 的 libAntares 的 DWARF
+# 里读 —— 和帧属性索引同一套机制(见 extract_enums)。
+#
+# 为什么必须这样: 头文件里改一个数组长度, 它后面的所有成员都会平移, 而抓帧是看不出
+# 假象的, 只会静默输出错列。实测: 本机两份 1.21.0 构建的 data_ 都在 +400, 而板上实测
+# 要用 +392, 差的 8 字节正好对应 MAX_FRAME_ELEMENT64 从 14 变成 13 —— 偏移是跟着
+# 头文件修订走的。旧版这里写死过 DATA_PTR_OFF = 392, 两头都不对, 现在由 DWARF 决定。
+#
+# (DWARF 类型名, 成员名(可以是 a.b.c 形式的成员路径), BPF C 里的宏名)
+FRAME_OFFSETS = (
+    ("AntaresFrame",		"type_",			"FRAME_TYPE_OFF"),
+    ("AntaresFrame",		"prop32_",			"FRAME_PROP32_OFF"),
+    ("AntaresFrame",		"prop64_",			"FRAME_PROP64_OFF"),
+    ("AntaresFrame",		"data_",			"FRAME_DATA_OFF"),
+    ("AntaresFrameData",	"buf_size_",			"FRAME_DATA_SIZE_OFF"),
+    ("Antares_frame_list_",	"deqFrameSize",			"LIST_DEQ_SIZE_OFF"),
+    # 帧链是 std::deque<Antares_frame_handle>。下面两项进的是 libstdc++ 的内部
+    # (_Deque_base::_M_impl), 但和上面几个一样是**成员偏移**, 所以同样问 DWARF ——
+    # 它是被 hook 的那个 .so 编译生成时用的 libstdc++ 头文件的布局, 比写死准。
+    ("Antares_frame_list_",	"deqFrame._M_impl._M_start",	"DEQ_START_OFF"),
+    ("Antares_frame_list_",	"deqFrame._M_impl._M_finish",	"DEQ_FINISH_OFF"),
+)
+
+# 数组长度也一并读出来。它必须等于 frame_property_e / frame_property64_e 里的
+# MAX_FRAME_ELEMENT / MAX_FRAME_ELEMENT64 —— 不等就说明枚举和结构体不是同一份头文件
+# 编译生成的, 这时候按枚举索引去读数组就会越界。用它当布局闸门。
+FRAME_COUNTS = (
+    ("AntaresFrame",	"prop32_",	"FRAME_PROP32_N"),
+    ("AntaresFrame",	"prop64_",	"FRAME_PROP64_N"),
+)
+
+ENUM_ARRAY_PAIRS = (
+    ("frame_property_e",	"MAX_FRAME_ELEMENT",	"FRAME_PROP32_N"),
+    ("frame_property64_e",	"MAX_FRAME_ELEMENT64",	"FRAME_PROP64_N"),
+)
+FRAME_SIZE_TYPE = "AntaresFrame"
+
+# std::deque **每块放几个元素** 这个数, 这里没有, DWARF 里也没有:
+# 它是 <bits/stl_deque.h> 里的编译期常量算出来的 (_GLIBCXX_DEQUE_BUF_SIZE = 512
+# 字节 / sizeof(元素)), 没有任何成员承载它; 本机这份 .so 也没带 .debug_macro 段
+# (producer 是纯 -g, 不是 -g3), 所以 gdb 问不出来。
+# 办法是不问, 改成从活的 deque 直接量: 起点迭代器的 _M_last - _M_first 恒等于
+# 一整块的字节数 —— libstdc++ 的 _M_set_node 就是按 _M_last = _M_first +
+# _S_buffer_size() 赋值的, 而 _M_first 永远指块首。见 proc_antares_list()。
+
+
+# 组件句柄里 id 句柄的偏移。
+#
+# 约定是"组件对象的第一个数据成员就是 Antares_plugin_id_handle id_", 但**这个偏移
+# 逐组件不同**, 所以这里不是"一个数"而是一张按模块名的表:
+#
+#   +0   组件类析构非虚, 没有 vptr, id_ 就是第一个数据成员
+#        (abs_demuxer.h: ~AbsDemuxer();)
+#   +8   组件类带虚析构, 编译器在 +0 放 vptr, id_ 落到 +8
+#        (ff_demuxer.h: virtual ~FFDemuxer();) —— 多数组件是这一类, 也是默认值
+#   +16  继承链上还压着基类的字节(blackmagic_send / sdi_send 各继承了两个
+#        DeckLink 的 COM 接口)
+#   其它 组件自己把 id_ 摆在结构体别处(ts_muxer 的 ts_muxer_obj_t 在 +48)
+#
+# 为什么不自动探测: "析构虚不虚"这个判据只对**一部分**组件成立。帧处理函数第一个
+# 参数在 DWARF 里被冲成 void*, 从签名看不出对象类型; 纯 C 编的组件、以及把 id 摆在
+# 结构体中间的组件, 根本没有 vptr 这个东西可看。所以只能按组件名列表 —— 但这张表
+# 是**一次性的**: 换组件不用改任何东西, --func 推出模块名后自动查表。
+#
+# 表里没有的模块取 PLUGIN_ID_OFF_DEFAULT。生效的那个值(以及它从哪来)每次都打在
+# stderr 的布局块里 (`组件 id: hdl +8 (xx_demuxer 不在表里, 用默认值)`), 一眼可见。
+# 读错的症状是 --id 一条都命中不了(退出时的统计里"命中 0 条、未命中 N 条")。
+PLUGIN_ID_OFF_DEFAULT = 8
+
+PLUGIN_ID_OFF_BY_MODULE = {
+    # ---- +0: 析构非虚(无 vptr), id_ 就是第一个数据成员 (21 个) ----
+    "abs_demuxer":		0,	"audio_backup":		0,	"csp_convert":		0,
+    "cutoff_handle_vid":	0,	"decoder_msdk":		0,	"encoder_aud":		0,
+    "encoder_msdk":		0,	"encoder_vid":		0,	"ffmpeg_demuxer":	0,
+    "file_demuxer":		0,	"fmp4_websocket":	0,	"image_to_video":	0,
+    "ip_analyse":		0,	"process_aud":		0,	"process_msdk":		0,
+    "process_vid":		0,	"raw_aud_analyse":	0,	"raw_vid_analyse":	0,
+    "rtp_analyse":		0,	"sdl_output":		0,	"video_backup":		0,
+
+    # ---- +8: 带虚析构, vptr 占 +0 (27 个, 和默认值一样) ----
+    # 值等于默认值, 列出来只为**标明这些是查过的**: 布局块里"在表里"= 核过,
+    # "不在表里, 用默认值"= 没核过、按多数情况取的 8。
+    "abs_input":		8,	"abs_publish2":		8,	"blackmagic_recv":	8,
+    "csf_input":		8,	"csf_output":		8,	"decoder_cpu":		8,
+    "es_analyse":		8,	"ff_demuxer":		8,	"file_slice_input":	8,
+    "fps_control":		8,	"fps_convert":		8,	"frame_delay":		8,
+    "hls_input":		8,	"http_recv":		8,	"mpegts_mux":		8,
+    "rtmp_publish3":		8,	"rtp_ts_demuxer":	8,	"rtp_ts_muxer":		8,
+    "rtsp_publish":		8,	"srt_recv":		8,	"srt_send":		8,
+    "subtitle_align":		8,	"time_adjustor":	8,	"udp_recv":		8,
+    "udp_send4":		8,	"uds_recv":		8,	"uds_send":		8,
+
+    # ---- +16: 继承链上还压着基类的字节 (2 个) ----
+    "blackmagic_send":		16,	"sdi_send":		16,
+
+    # ---- id_ 既不落在 +0 也不落在 +8 ----
+    "ts_muxer":			48,	"rtsp_pusher":		112,
+}
+
+# 还没核出来的模块(表里没有, 用默认值 8):
+#   rtp_demuxer / rtp_muxer     句柄类型是 typedef void*, 类型信息断了
+#   metrics_deal / http_send    帧函数自包含, 不调用任何带对象类型的函数
+#   post_analyse                对象里根本没有 id 成员, --id 无论取什么偏移都命中不了
+
+
+# ---------------------------------------------------------------------------
+# 帧属性列: 每一列怎么显示、给哪些帧类型显示
+# ---------------------------------------------------------------------------
+# 内容对应 显示的帧属性列表.txt, 也就是 Antares_frame_define.h 里 frame_property_e /
+# frame_property64_e 那张注释表。**要改输出就改这张表**, 别处不用动。
+#
+#   (属性, 取值, 枚举 tag, 适用帧类型)
+#
+#   属性      frame_property_e / frame_property64_e 里的成员名, 也是**输出的列名**。
+#             索引是每次运行查 DWARF 得到的, 所以头文件中间插属性不会错位。
+#   取值      "int" / "int64" 直接打数字, "enum" 按枚举名打。一个属性一格, 没有特例 ——
+#             这也是为什么去掉了"合并显示"(见下)。
+#   枚举 tag  只有取值是 "enum" 时看它。tag 或 typedef 名都行 —— 查 DWARF 时会先剥掉
+#             typedef, 所以 Antares_codec_id_e / Antares_codec_id_t 两种写法等价。
+#             写空了或者写错了, 那一列退化成打数字, **并在 stderr 报一声**(不报的话
+#             你会以为上游没设值, 而不是 tag 写错了)。
+#   帧类型    只有两种写法:
+#               "x"                哪类帧都不显示 —— 这种列不进输出, 留在表里只为
+#                                  "认领"这个名字, 免得它被当成"DWARF 里新出现的属性"
+#               其余是 v/a/s/d/o 的组合, 表示哪些帧类型要显示它(如 "avsd"、"a")
+#             写错字母(不在 v/a/s/d/o 里)会在启动时报出来, 不静默漏掉。
+#
+# 某列对当前帧不适用就打 "-", 不是不打印这一格。理由: 一个 demuxer 的帧链上视频、
+# 音频、字幕帧是混着的, 每行按自己的类型伸缩的话日志就没法对齐着看, 表头也只能写成
+# "所有可能出现的列"。保持定宽, awk 的列号才是稳定的。
+#
+# 行序 = 输出列序, 而且**就是 Antares_frame_define.h 里的枚举原序**(frame_property_e
+# 在前, frame_property64_e 在后)。所以这张表可以逐行和那个头文件对读; 要调列序就把
+# 行搬位置, 不要改别的。
+FRAME_PROPERTY_COLUMNS = (
+    ("FRAME_WIDTH",				"int",		None,				"v"),
+    ("FRAME_HEIGHT",				"int",		None,				"v"),
+    ("FRAME_DELETE",				"int",		None,				"x"),
+    ("FRAME_CSP",				"enum",		"Antares_csp_e",		"v"),
+    ("FRAME_RATIO_NUM",				"int",		None,				"v"),
+    ("FRAME_RATIO_DEN",				"int",		None,				"v"),
+    ("FRAME_FPS_DEN",				"int",		None,				"v"),
+    ("FRAME_FPS_NUM",				"int",		None,				"v"),
+    ("FRAME_BITRATE",				"int",		None,				"av"),
+    ("FRAME_PID",				"int",		None,				"avsdo"),
+    ("FRAME_CODEC_ID",				"enum",		"Antares_codec_id_e",		"avs"),
+    ("FRAME_KEY_FLAG",				"int",		None,				"v"),
+    ("FRAME_PROG_NUM",				"int",		None,				"avsdo"),
+    ("FRAME_SAMPLE_RATE",			"int",		None,				"a"),
+    ("FRAME_SAMPLE_FMT",			"enum",		"Antares_sample_fmt_e",		"a"),
+    ("FRAME_BLOCK_ALIGN",			"int",		None,				"x"),
+    ("FRAME_FONT",				"int",		None,				"x"),
+    ("FRAME_FONT_SIZE",				"int",		None,				"x"),
+    ("FRAME_FONT_COLOR",			"int",		None,				"x"),
+    ("FRAME_TANSPARENCE",			"int",		None,				"x"),
+    ("FRAME_DATA_LOSS",				"int",		None,				"av"),
+    ("FRAME_CHANNEL_LAYOUT",			"enum",		"Antares_channel_layout_e",	"a"),
+    ("FRAME_POS_X",				"int",		None,				"x"),
+    ("FRAME_POS_Y",				"int",		None,				"x"),
+    ("FRAME_PIC_STRUCTURE",			"enum",		"Antares_pic_structure_e",	"v"),
+    ("FRAME_PIC_TYPE",				"enum",		"Antares_picture_type_t",	"v"),
+    ("FRAME_LANGUAGE",				"int",		None,				"x"),
+    ("FRAME_COLOR_PRIMARIES",			"enum",		"Antares_ColorPrimaries",	"v"),
+    ("FRAME_COLOR_TRANSFER",			"enum",		"Antares_ColorTransfer",	"v"),
+    ("FRAME_COLOR_MATRIX",			"enum",		"Antares_ColorMatrix",		"v"),
+    ("FRAME_COLOR_RANGE",			"enum",		"Antares_color_range_e",	"v"),
+    ("FRAME_BIT_DEPTH",				"int",		None,				"x"),
+    ("FRAME_INDEX",				"int",		None,				"x"),
+    ("FRAME_DIST_TIMES",			"int",		None,				"x"),
+    ("FRAME_UNION_LAYOUT_POS",			"int",		None,				"x"),
+    ("FRAME_INIT_TIMEBASE_NUM",			"int",		None,				"a"),
+    ("FRAME_INIT_TIMEBASE_DEN",			"int",		None,				"a"),
+    ("FRAME_CUVA_PROVIDER_ORIENTED_CODE",	"int",		None,				"v"),
+    ("FRAME_INFO_TYPE",				"enum",		"Antares_info_type_e",		"x"),
+    ("FRAME_SCTE35_COVERING",			"int",		None,				"v"),
+    ("FRAME_FORCE_IDR",				"int",		None,				"v"),
+    ("FRAME_FAKE",				"int",		None,				"av"),
+    ("FRAME_PROFILE_IDC",			"int",		None,				"x"),
+    ("FRAME_LEVEL_IDC",				"int",		None,				"x"),
+    ("FRAME_STREAM_START",			"int",		None,				"x"),
+    ("FRAME_FIELD_ORDER",			"enum",		"Antares_field_order_e",	"v"),
+    ("FRAME_MONITOR",				"int",		None,				"av"),
+    ("FRAME_MPEGTS_STREAM_IDENTIFIER",		"int",		None,				"x"),
+    ("FRAME_LONG_PTS",				"int64",	None,				"av"),
+    ("FRAME_LONG_DTS",				"int64",	None,				"av"),
+    ("FRAME_LONG_CTS",				"int64",	None,				"x"),
+    ("FRAME_LONG_CCTS",				"int64",	None,				"x"),
+    ("FRAME_LONG_DURATION",			"int64",	None,				"x"),
+    ("FRAME_LONG_FPOS",				"int64",	None,				"x"),
+    ("FRAME_LONG_FSIZE",			"int64",	None,				"x"),
+    ("FRAME_LONG_CC",				"int64",	None,				"x"),
+    ("FRAME_LONG_TIME",				"int64",	None,				"x"),
+    ("FRAME_INFO_UID",				"int64",	None,				"x"),
+    ("FRAME_CREATE_TIME_POINT",			"int64",	None,				"x"),
+    ("FRAME_LONG_CAP_TIME",			"int64",	None,				"av"),
+    ("FRAME_LONG_ABS_PLAY_TIME",		"int64",	None,				"av"),
+    ("FRAME_LONG_PKT_TIMESTAMP",		"int64",	None,				"avs"),
+)
+
+# 这两个不是"帧属性", 只是枚举里的结构性成员, 不进表、也不算"新属性":
+#   MAX_FRAME_ELEMENT / MAX_FRAME_ELEMENT64  数组长度的哨兵, 真正的成员是它前面的
+#   FRAME_UID                                和 FRAME_INFO_UID 是同一个索引的两个名字
+NOT_A_PROPERTY = ("FRAME_UID",)
+
+# 帧类型 -> 类别。按**枚举名**而不是数值对, 头文件里加一个类型数值平移了也不会认错。
+# 不在这张表里的类型(NONE/IMAGE/TEXT/INFO/STREAM_END, 以及头文件里将来新加的)一律
+# 算"其它"(o)。libAntares 实测 1.21.0 里这几个类型名都在。
+TYPE_CATEGORIES = (
+    # 视频
+    ("v", ("ANTARES_VIDEO", "ANTARES_VIDEO_STREAM", "ANTARES_VIDEO_MSDK",
+           "ANTARES_VIDEO_CUDA", "ANTARES_VIDEO_EXTERNAL", "ANTARES_VIDEO_AVFRAME",
+           "ANTARES_VIDEO_VPE")),
+    # 音频
+    ("a", ("ANTARES_AUDIO", "ANTARES_AUDIO_STREAM")),
+    # 字幕
+    ("s", ("ANTARES_SUBTITTLE", "ANTARES_SUB_STREAM")),
+    # 数据
+    ("d", ("ANTARES_DATA",)),
+    # 其余(NONE/IMAGE/TEXT/INFO/STREAM_END + 新出现的) -> 其它
+)
+UNKNOWN_CATEGORY = "o"
+
+# 五种帧类别的全集: v=视频 a=音频 s=字幕 d=数据 o=其它。
+# 表里最后一列要么是 "x", 要么是这个集合的子集。用来校验表里的字写没写错。
+CATEGORIES = "vasdo"
+
+# 表头 = 这个固定前缀 + FRAME_PROPERTY_COLUMNS 落出来的列名 + 组件 id(放最后一列:
+# id 可能含空格, awk '{print $NF}' 直接取)。列名都取自表, 所以头和数据行不会对不上。
+HEADER_PREFIX = "#dir ktime_ns proc tid qlen type size"
+
+bpf_text = """
+#include <uapi/linux/ptrace.h>
+
+/* FRAME_*_OFF / FRAME_PROP*_N / LIST_DEQ_SIZE_OFF 这些帧结构成员偏移和数组长度,
+ * 以及 PLUGIN_ID_OFF, 都不在这里写死: 由 build_layout_defines() 查 libAntares 的
+ * DWARF(PLUGIN_ID_OFF 除外, 它按模块名查表)后, 在编译前拼进本 C 源码的前缀里。
+ * 结构体成员会随头文件改动整体平移, 查 DWARF 才不会静默错位。
+ *
+ * 这里**没有**帧属性索引: 属性数组整块搬进 event, 由 Python 按帧类型挑列。 */
+
+/* 帧数据缓冲区大小读出来的值大过这个数, 说明取到的不是缓冲区大小(被 hook 的
+ * 二进制与头文件不同修订时可能发生), 输出哨兵值而不是垃圾数字 */
+#define SIZE_LIMIT              (1ULL << 31)
+#define SIZE_INVALID            0xffffffffULL
+
+/* libstdc++ std::deque 的 _M_start / _M_finish 偏移和别的帧结构成员一样由
+ * build_layout_defines() 注入 —— 它们也是成员偏移, DWARF 里有。
+ * "每块几个元素"则哪里都没有, 由 proc_antares_list() 从活的 deque 里量,
+ * 见那边的 block_bytes。 */
+
+struct event {
+    u64 timestamp;          /* bpf_ktime_get_ns(), 内核单调时钟, ns */
+    u64 qlen;               /* 本次调用时帧链上共有多少帧 */
+    u64 data_size;          /* 帧数据缓冲区大小 */
+    u32 enter;              /* 1 = 函数入口, 0 = 函数返回值 */
+    u32 process_id;
+    u32 tid;
+    u32 type;               /* Antares_type_t; Antares_type_e 里没有 FRAME_TYPE 这一项,
+                             * 它取自 AntaresFrame::type_ 这个独立成员, 不是属性元素 */
+    /* 两个属性数组**整块**搬过来, 由 Python 侧按帧类型决定显示哪些列。
+     * 数组长度不写死: FRAME_PROP32_N / FRAME_PROP64_N 由 build_layout_defines()
+     * 从 DWARF 取, 并与枚举里的 MAX_FRAME_ELEMENT / MAX_FRAME_ELEMENT64 对齐过。 */
+    s32 prop32[FRAME_PROP32_N];
+    s64 prop64[FRAME_PROP64_N];
+    char id[128];
+};
+
+BPF_PERF_OUTPUT(events);
+BPF_ARRAY(m_event, struct event, 1);
+
+/* 入口 probe 按线程缓存组件的 hdl: uretprobe 拿不到第 1 个参数,
+ * --ret 1 时出口事件靠它把组件 id 找回来。条数以线程数为界, 不做删除。 */
+BPF_HASH(hdl_by_tid, u32, u64, 4096);
+
+/* 低版本内核需要这么做 */
+#define bpf_probe_read_user bpf_probe_read
+#define bpf_probe_read_user_str bpf_probe_read_str
+
+static inline u64 get_antares_list_size(u64 list)
+{
+    u64 size = 0;
+    /* Antares_frame_list_::deqFrameSize (在 infoFrameSize 之后) */
+    bpf_probe_read_user(&size, sizeof(size), (void *)(list + LIST_DEQ_SIZE_OFF));
+    return size;
+}
+
+static inline u32 get_antares_frame_type(u64 frame)
+{
+    u32 value = 0;
+    bpf_probe_read_user(&value, sizeof(value), (void *)(frame + FRAME_TYPE_OFF));
+    return value;
+}
+
+static inline u64 get_antares_frame_data_addr(u64 frame)
+{
+    u64 data = 0;
+    bpf_probe_read_user(&data, sizeof(data), (void *)(frame + FRAME_DATA_OFF));
+    return data;
+}
+
+static inline u32 get_antares_frame_data_size(u64 data)
+{
+    u32 value = 0;
+    /* AntaresFrameData::buf_size_ */
+    bpf_probe_read_user(&value, sizeof(value), (void *)(data + FRAME_DATA_SIZE_OFF));
+    return value;
+}
+
+/* 组件 id 的取值路径 (Antares_define.h: Antares_plugin_id_interface):
+ *     hdl + PLUGIN_ID_OFF -> Antares_plugin_id_handle -> + 8 -> id 字符串
+ * 同一个指针的 +0 是组件 name。
+ *
+ * PLUGIN_ID_OFF 是**编译这条 C 之前**按 --func 推出的模块名查表定下来的: 组件类带
+ * 虚析构函数时 vptr 占 +0, 约定里"第一个数据成员就是 id 句柄"因此落在 +8, 但析构
+ * 非虚的组件在 +0、个别组件在别处(表见脚本顶部的 PLUGIN_ID_OFF_BY_MODULE)。
+ * 这个宏由 build_layout_defines() 注入, 不是这里写死的。 */
+static inline void read_plugin_id(u64 hdl, char *id, int len)
+{
+    u64 id0 = 0, id1 = 0;
+    if (hdl == 0)
+        return;
+    bpf_probe_read_user(&id0, sizeof(id0), (void *)(hdl + PLUGIN_ID_OFF));
+    bpf_probe_read_user(&id1, sizeof(id1), (void *)(id0 + 8));
+    bpf_probe_read_user_str(id, len, (void *)id1);
+}
+
+/* 把这一帧的类型、数据大小和两个属性数组填进 event。调用前 struct event 必须已经
+ * 清零: 读失败的 bpf_probe_read_user 不保证写目标, 靠 memset 兜成 0, 而 perf_submit
+ * 会拷贝整个结构, 未初始化的填充字节还会泄漏内核栈内容。
+ *
+ * 属性按**整块**读, 不是逐个属性读: 每个 bpf_probe_read_user 都要写目的指针 + 长度
+ * + 地址(约 6~8 条指令), 而上面那个 #pragma unroll 会展开成 MAX_FRAMES_PER_CALL 份。
+ * 逐个属性读 33 列 * 16 帧 * ~8 条 直接顶穿 4096 指令预算。整块读每帧只要 2 次调用
+ * (48*4 + 14*8 = 304 字节), 而且"显示哪几列"是随帧类型变的, 那个判断在 C 里做不出来
+ * —— 交给 Python。 */
+static inline void fill_frame(u64 f, struct event *e)
+{
+    u64 data = 0;
+    u64 buf_size = 0;
+
+    e->type = get_antares_frame_type(f);
+
+    /* prop32_ 的元素是 int(有符号), GetProp32 交出的也是 int, 所以按 s32 读: 读成
+     * u32 的话插件 SetProp32(prop, -1) 会打成 4294967295 —— 头文件对 FRAME_DELETE /
+     * FRAME_KEY_FLAG / FRAME_FORCE_IDR 只说"非0表示…", 没把负数排除在外。
+     * prop64_ 一直是 s64, 没这个问题。 */
+    bpf_probe_read_user(e->prop32, sizeof(e->prop32), (void *)(f + FRAME_PROP32_OFF));
+    bpf_probe_read_user(e->prop64, sizeof(e->prop64), (void *)(f + FRAME_PROP64_OFF));
+
+    data = get_antares_frame_data_addr(f);
+    if (data != 0)
+        buf_size = get_antares_frame_data_size(data);
+    if (buf_size > SIZE_LIMIT)
+        buf_size = SIZE_INVALID;
+    e->data_size = buf_size;
+}
+
+/* enter / exit 两条路径都汇流到这里: 帧链在 PARM2 (入口) 或返回值 (出口) 上 */
+static inline void proc_antares_list(struct pt_regs *ctx, u64 hdl, u64 list,
+                                     struct event *e)
+{
+    u64 base = 0;
+    void *cur = 0, *first = 0, *last = 0;
+    void **node = 0;
+    void *f_cur = 0;
+    void **f_node = 0;
+
+    if (list == 0)
+        return;
+
+    read_plugin_id(hdl, e->id, sizeof(e->id));
+
+    /* 帧链上一共多少帧; 也是"16 帧上限有没有截断"的唯一指示 */
+    e->qlen = get_antares_list_size(list);
+    e->timestamp = bpf_ktime_get_ns();
+
+    base = list;
+    if (bpf_probe_read_user(&cur,   8, (void *)(base + DEQ_START_OFF + 0)))  return;
+    if (bpf_probe_read_user(&first, 8, (void *)(base + DEQ_START_OFF + 8)))  return;
+    if (bpf_probe_read_user(&last,  8, (void *)(base + DEQ_START_OFF + 16))) return;
+    if (bpf_probe_read_user(&node,  8, (void *)(base + DEQ_START_OFF + 24))) return;
+
+    if (bpf_probe_read_user(&f_cur,  8, (void *)(base + DEQ_FINISH_OFF + 0)))  return;
+    if (bpf_probe_read_user(&f_node, 8, (void *)(base + DEQ_FINISH_OFF + 24))) return;
+
+    /* 一整块的字节数。不写死也不查 DWARF(那个"_GLIBCXX_DEQUE_BUF_SIZE / sizeof(元素)"
+     * 的编译期常量没有成员承载), 而是从这条链自己量: _M_start._M_first 永远指块首,
+     * _M_last 又被 libstdc++ 赋成 _M_first + _S_buffer_size(), 所以这个差不随链上
+     * 有几帧变, 恒等于一块的大小。两个值上面本来就读了, 这里不额外读内存。 */
+    u64 block_bytes = (u64)((char *)last - (char *)first);
+
+#pragma unroll
+    for (int i = 0; i < MAX_FRAMES_PER_CALL; i++)
+    {
+        if (cur == f_cur && node == f_node)
+            break;
+
+        /* f 故意留 0 初值: 读取失败时靠它挡掉已释放/无效的帧 */
+        u64 f = 0;
+        (void)bpf_probe_read_user(&f, 8, cur);
+        if (f != 0)
+        {
+            fill_frame(f, e);
+            events.perf_submit(ctx, e, sizeof(*e));
+        }
+
+        cur = (void *)((char *)cur + 8);
+        if (cur == last)
+        {
+            /* 当前块到底了, 顺着 _M_start._M_node 走到下一个块 */
+            void **next_node = (void **)((char *)node + sizeof(void *));
+            void *new_first = 0;
+            if (bpf_probe_read_user(&new_first, 8, next_node)) break;
+            node = next_node;
+            first = new_first;
+            last = (void *)((char *)first + block_bytes);
+            cur = first;
+        }
+    }
+}
+
+int handle_list_enter(struct pt_regs *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 tid = pid_tgid & 0xffffffff;
+    u32 pid = pid_tgid >> 32;
+    u64 h = PT_REGS_PARM1(ctx);
+    u64 f = PT_REGS_PARM2(ctx);
+    u32 key = 0;
+    struct event *e = 0;
+
+    if (h == 0 || f == 0)
+        return 0;
+
+    /* 缓存 hdl 必须先做, 不管这次要不要提交事件 */
+    hdl_by_tid.update(&tid, &h);
+
+    if (!EMIT_ON_ENTER)
+        return 0;
+
+    e = m_event.lookup(&key);
+    if (e == 0)
+        return 0;
+
+    __builtin_memset(e, 0, sizeof(*e));
+    e->process_id = pid;
+    e->tid = tid;
+    e->enter = 1;
+    proc_antares_list(ctx, h, f, e);
+    return 0;
+}
+
+int handle_list_exit(struct pt_regs *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 tid = pid_tgid & 0xffffffff;
+    u32 pid = pid_tgid >> 32;
+    u64 f = PT_REGS_RC(ctx);
+    u32 key = 0;
+    struct event *e = 0;
+    u64 *h = 0;
+
+    if (f == 0)
+        return 0;
+
+    e = m_event.lookup(&key);
+    if (e == 0)
+        return 0;
+
+    __builtin_memset(e, 0, sizeof(*e));
+    e->process_id = pid;
+    e->tid = tid;
+    e->enter = 0;
+
+    h = hdl_by_tid.lookup(&tid);
+    proc_antares_list(ctx, h ? *h : 0, f, e);
+    return 0;
+}
+
+"""
+
+# ===========================================================================
+# 枚举表: 从 <脚本目录>/lib/libAntares.so 的 DWARF 里提取
+# ===========================================================================
+#
+# 下面几个是 DWARF 里的枚举名。缺任何一个都直接报错 —— 这几个是"没有就干不了活"的:
+# 两个属性枚举决定列索引, Antares_type_e 决定帧类型。
+#
+# 只列**必需**的。查名字要用的那批枚举(Antares_csp_e / Antares_sample_fmt_e /
+# Antares_codec_id_e ...)不在这里, 而是由 FRAME_PROPERTY_COLUMNS 第 3 列现推 ——
+# 见 enum_tags()。写死一份就会和表脱节。
+REQUIRED_ENUMS = (
+    "frame_property_e",
+    "frame_property64_e",
+    "Antares_type_e",
+)
+
+# 帧类型那一列查名字用的 tag
+TYPE_ENUM_TAG = "Antares_type_e"
+
+
+def enum_tags():
+    """要 gdb 去 DWARF 里查的枚举名。
+
+    必需的那几个 + FRAME_PROPERTY_COLUMNS 第 3 列里写过的所有 tag。"""
+    names = list(REQUIRED_ENUMS)
+    for col in FRAME_PROPERTY_COLUMNS:
+        if col[2] and col[2] not in names:
+            names.append(col[2])
+    return names
+
+GDB_DWARF_SCRIPT = '''import gdb, json
+
+SO = %(so)s
+TAGS = %(tags)s
+OFFSETS = %(offsets)s
+COUNTS = %(counts)s
+SIZE_TYPE = %(size_type)s
+
+gdb.execute("set pagination off")
+gdb.execute('file "' + SO + '"')
+
+enums = {}
+for tag in TAGS:
+    try:
+        t = gdb.lookup_type(tag)
+    except Exception:
+        continue
+    # 头文件里枚举常常是 "typedef enum X_e {..} X_t;" 这种写法, 于是
+    # gdb.lookup_type 给回的是 typedef 而不是 enum 本身(它的 tag 还可能带尾下划线,
+    # 如 Antares_color_range_)。剥掉 typedef 再判, 这样 TS 里写的 tag 名和 typedef
+    # 名两种写法都能取到 —— 我们按请求的那个名字记, 不按真实 tag 名。
+    try:
+        t = t.strip_typedefs()
+    except Exception:
+        pass
+    if t.code != gdb.TYPE_CODE_ENUM:
+        continue
+    enums[tag] = [[f.name, int(f.enumval)] for f in t.fields()]
+
+# 成员偏移。&((T *)0)->m 在 gdb 里算出来就是该成员相对类型起始的偏移,
+# 私有成员也读得到; 转成 long 是因为 gdb.Value 的指针不能直接 int()。
+# 拼字符串而不用百分号格式化: 本脚本自己是被百分号格式化拼出来的, 里面若再出现
+# 百分号会和外面的占位符打架(实测会报 "not enough arguments for format string")。
+layout = {}
+for tname, member, mac in OFFSETS:
+    try:
+        expr = "(long)&((" + tname + " *)0)->" + member
+        layout[mac] = int(gdb.parse_and_eval(expr))
+    except Exception:
+        pass
+
+# 数组元素个数 = sizeof(成员) / sizeof(成员[0])。用成员自身的元素类型而不是
+# sizeof(int), 免得元素类型变了(比如 int -> int64_t)在这里悄悄算错。
+for tname, member, mac in COUNTS:
+    try:
+        elem = "sizeof(((" + tname + " *)0)->" + member + "[0])"
+        if int(gdb.parse_and_eval(elem)) <= 0:
+            continue
+        total = "sizeof(((" + tname + " *)0)->" + member + ")"
+        layout[mac] = int(gdb.parse_and_eval(total)) // int(gdb.parse_and_eval(elem))
+    except Exception:
+        pass
+
+try:
+    layout["FRAME_SIZE"] = int(gdb.parse_and_eval("sizeof(" + SIZE_TYPE + ")"))
+except Exception:
+    pass
+
+print("@@@XTRACE_ENUMS@@@")
+print(json.dumps({"enums": enums, "layout": layout}))
+print("@@@XTRACE_END@@@")
+'''
+
+ENUM_BEGIN = "@@@XTRACE_ENUMS@@@"
+ENUM_END = "@@@XTRACE_END@@@"
+
+# POSIX ERE 的元字符。不用 re.escape: bcc 用的是 POSIX 正则, 不是 Python 的 re,
+# 而 re.escape 会多转义 - & ~ # 和空格这类 POSIX ERE 里没有意义的字符
+# (\_ \& 在 POSIX ERE 里是未定义行为)。符号名走这里, 只转义真正有意义的。
+ERE_META = ".^$*+?()[]{}|\\"
+
+
+def die(msg):
+    sys.stderr.write("error: %s\n" % msg)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def to_text(raw):
+    """子进程管道读出来是 bytes; 解码失败也不能让工具崩在报错信息上。"""
+    return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+
+
+def find_antares_lib():
+    """枚举表的唯一来源: <脚本目录>/lib/ 下的 libAntares.so。
+
+    找固定位置而不是做成命令行参数: 部署约定就是它一定在那儿, 多一个参数就多一种
+    "拿别的库跑出错的偏移" 的用法。"""
+    exact = os.path.join(SCRIPT_DIR, "lib", "libAntares.so")
+    if os.path.exists(exact):
+        return exact
+    # 软链接没建时退回 glob, 免得工具只因为少一条 ln 就完全不能用
+    hits = sorted(glob.glob(LIB_GLOB))
+    if not hits:
+        die("找不到 libAntares.so。\n"
+            "  试过: %s\n"
+            "        %s\n"
+            "  本工具按部署约定从脚本所在目录的 lib/ 下读 enum, 请把 libAntares.so\n"
+            "  和它的软链接 lib/libAntares.so 放到那里。"
+            % (exact, LIB_GLOB))
+    return hits[0]
+
+
+def extract_dwarf(so_path):
+    """跑一次 gdb, 把需要的枚举表和帧结构成员偏移从 DWARF 里读出来。
+
+    枚举和偏移同一次调用拿完: gdb 打开 10MB 的 .so 本身约 0.2s, 多问几项几乎不额外花时间。"""
+    script = GDB_DWARF_SCRIPT % {
+        "so": repr(so_path),
+        "tags": repr(enum_tags()),
+        "offsets": repr(FRAME_OFFSETS),
+        "counts": repr(FRAME_COUNTS),
+        "size_type": repr(FRAME_SIZE_TYPE),
+    }
+
+    fd, script_path = tempfile.mkstemp(prefix="xtrace-gdb-", suffix=".py")
+    try:
+        with os.fdopen(fd, "w") as fp:
+            fp.write(script)
+        try:
+            proc = subprocess.Popen(
+                ["gdb", "-batch", "-nx", "-ex", "set confirm off",
+                 "-ex", "set pagination off", "-x", script_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = proc.communicate()
+        except OSError as exc:
+            die("调不起 gdb (%s)。\n"
+                "  本工具每次运行都用 gdb 从 %s 的 DWARF 里读枚举表和帧属性索引,\n"
+                "  没有别的来源, 所以目标机上必须装 gdb。" % (exc, so_path))
+    finally:
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
+
+    text = to_text(out)
+    begin = text.find(ENUM_BEGIN)
+    end = text.find(ENUM_END, begin + 1) if begin >= 0 else -1
+    if begin < 0 or end < 0:
+        die("gdb 没能输出枚举表 (%s 被 strip 了, 或者根本不是 ELF?)。\n"
+            "  gdb stderr:\n%s" % (so_path, to_text(err)[-2000:]))
+    data = json.loads(text[begin + len(ENUM_BEGIN):end])
+    return data["enums"], data["layout"]
+
+
+def check_required_enums(enums, source_desc):
+    """缺任何一个必要的枚举都直接报错, 不静默降级。"""
+    missing = [t for t in REQUIRED_ENUMS if not enums.get(t)]
+    if missing:
+        die("从 %s 里读不到这些枚举: %s\n"
+            "  该文件是不是被 strip 了, 或者不是这份代码编出来的?"
+            % (source_desc, ", ".join(missing)))
+
+
+def check_layout(layout, enums, source_desc):
+    """布局闸门: 抓帧前把关。
+
+    现在偏移都是从同一份 DWARF 读的,
+    所以闸门查**自洽性**: DWARF 里 prop32_/prop64_ 的元素个数, 必须等于枚举里
+    的 MAX_FRAME_ELEMENT / MAX_FRAME_ELEMENT64。不等就说明枚举和结构体不是同一份
+    头文件编出来的, 按枚举索引去读数组会越界。"""
+    missing = [mac for _, _, mac in FRAME_OFFSETS if mac not in layout]
+    missing += [mac for _, _, mac in FRAME_COUNTS if mac not in layout]
+    if "FRAME_SIZE" not in layout:
+        missing.append(FRAME_SIZE_TYPE)
+    if missing:
+        die("从 %s 的 DWARF 里读不到这些帧布局信息: %s\n"
+            "  该文件是不是被 strip 了, 或者不是这份代码编出来的?"
+            % (source_desc, ", ".join(missing)))
+
+    for tag, enum_member, mac in ENUM_ARRAY_PAIRS:
+        declared = dict(enums[tag]).get(enum_member)
+        derived = layout[mac]
+        if declared != derived:
+            die("%s 的 %s 是 %s, 但 DWARF 里对应数组的元素个数是 %d (来自 %s)。\n"
+                "  枚举和结构体不是同一份头文件编出来的 —— 按枚举索引读这个数组会越界,\n"
+                "  所以停在这里。请确认部署的 libAntares 与头文件是同一修订。\n"
+                "  新的枚举表还是照常写在 %s 里, 可以先看那个。"
+                % (tag, enum_member, declared, derived, source_desc, ENUM_DUMP_NAME))
+
+
+def format_layout(layout, enums, source_desc, id_off, id_src):
+    """把读到的帧布局打成一行行 stderr, 供人工核对。
+
+    这是取代 DATA_PTR_OFF = 392 那个经验值的关键: 换一台机器、换一份 libAntares,
+    这里显示的就是那份二进制的真实布局, 不用再去翻头文件推算、也不用猜。
+
+    id_off / id_src 是组件 id 那个偏移和它的出处 —— 上面几行都来自 DWARF, 只有它
+    来自脚本里的表"""
+    off = dict((mac, layout[mac]) for _, _, mac in FRAME_OFFSETS)
+    return ("帧布局(从 %s 的 DWARF 读):\n"
+            "    sizeof(%s) = %d\n"
+            "    type_   +%-4d  prop32_ +%-4d (x%d)  prop64_ +%-4d (x%d)\n"
+            "    data_   +%-4d  AntaresFrameData::buf_size_ +%d\n"
+            "    Antares_frame_list_::deqFrameSize +%d\n"
+            "    std::deque 帧链: _M_start +%d  _M_finish +%d  (每块几个元素运行时从 deque 量)\n"
+            "    组件 id: hdl +%-4d (%s)\n"
+            "    frame_property_e->MAX_FRAME_ELEMENT=%s、frame_property64_e->MAX_FRAME_ELEMENT64=%s"
+            % (source_desc, FRAME_SIZE_TYPE, layout["FRAME_SIZE"],
+               off["FRAME_TYPE_OFF"], off["FRAME_PROP32_OFF"], layout["FRAME_PROP32_N"],
+               off["FRAME_PROP64_OFF"], layout["FRAME_PROP64_N"],
+               off["FRAME_DATA_OFF"], off["FRAME_DATA_SIZE_OFF"],
+               off["LIST_DEQ_SIZE_OFF"],
+               off["DEQ_START_OFF"], off["DEQ_FINISH_OFF"], id_off, id_src,
+               dict(enums["frame_property_e"]).get("MAX_FRAME_ELEMENT"),
+               dict(enums["frame_property64_e"]).get("MAX_FRAME_ELEMENT64")))
+
+
+def format_c_enum(tag, pairs):
+    """按 C 的写法打印, 方便和 Antares_frame_define.h 直接对拍。
+    连续的隐式值不写 "= N"(这正是 C 的语义), 也让"中间插入属性"导致的索引平移
+    一眼可见: 本来没有 = N 的地方会突然冒出一个。
+
+    只写 enum 不写收尾的 typedef 别名: 别名纯粹是装饰, 而且**头文件里根本没有
+    统一的规律** —— 多数是 "typedef enum X_e {..} X_t;", 但 Antares_info_type_e
+    的 tag 和 typedef 同名, Antares_color_range_e 的 tag 叫 Antares_color_range_。
+    写死一条推导规则就一定会对不上几个, 不如不写, 这样所有枚举一视同仁。"""
+    lines = ["    enum %s" % tag, "    {"]
+    prev = None
+    for i, (name, val) in enumerate(pairs):
+        if i == 0 or val != prev + 1:
+            lines.append("        %s = %d," % (name, val))
+        else:
+            lines.append("        %s," % name)
+        prev = val
+    lines.append("    };")
+    return "\n".join(lines)
+
+
+def dump_enums(enums, stream):
+    """把**本工具用到的全部**枚举落下来。
+
+    这里必须用 enum_tags() 而不是 REQUIRED_ENUMS: 后者只是"没有就干不了活"的那三个,
+    而查名字用的那一批(Antares_csp_e / Antares_sample_fmt_e / Antares_codec_id_e ...)
+    同样是从这个文件里读的, 漏掉它们等于对拍时少了一半依据。"""
+    first = True
+    for tag in enum_tags():
+        if not enums.get(tag):
+            # 表里 tag 写错、或这个版本确实没这个类型: 抓帧那边已经就那一列告警过, 这里不重复
+            continue
+        if not first:
+            stream.write("\n")
+        stream.write(format_c_enum(tag, enums[tag]) + "\n")
+        first = False
+
+
+def write_enum_dump(enums, path, source_desc):
+    """每次运行都把读到的枚举表落到 <脚本目录>/xtrace.enum。
+
+    这是"工具认的枚举"的唯一可查记录: 事后怀疑某列错位时, 直接和
+    Antares_frame_define.h 对拍这个文件就够了, 不用重跑。
+    写不进去不致命(只读挂载点等), 退回打到 stderr, 信息不丢。"""
+    try:
+        with open(path, "w") as fp:
+            fp.write("# xtrace 从 %s 读到的枚举表\n" % source_desc)
+            fp.write("# 与 Antares_frame_define.h 对拍用; 列出本工具用到的全部枚举"
+                     "(必需的三个 + 表里点过名的), 空行分隔\n")
+            fp.write("# 只写 enum 本身, 不写头文件收尾的那个 typedef 别名 —— 别名的"
+                     "命名在头文件里没有统一规律, 硬凑反而对不上\n\n")
+            dump_enums(enums, fp)
+    except (IOError, OSError) as exc:
+        sys.stderr.write("WARNING: 写不了 %s (%s), 枚举表改打到 stderr\n"
+                         % (path, exc))
+        dump_enums(enums, sys.stderr)
+        sys.stderr.flush()
+        return
+    sys.stderr.write("枚举表来源: %s\n" % source_desc)
+    sys.stderr.write("枚举表已写入: %s\n" % path)
+    sys.stderr.flush()
+
+
+def build_layout_defines(layout, id_off):
+    """把帧结构的偏移/数组长度生成 #define。
+
+    前两批从 DWARF 读;
+    最后 PLUGIN_ID_OFF 读不到, 是按 --func 推出的模块名查表来的 —— 单独一段,
+    别和上面混。"""
+    lines = []
+    for _, _, macro in FRAME_OFFSETS:
+        lines.append("#define %-22s %d" % (macro, layout[macro]))
+    for _, _, macro in FRAME_COUNTS:
+        lines.append("#define %-22s %d" % (macro, layout[macro]))
+    lines.append("")
+    lines.append("/* 下面这个不是从 DWARF 读的, 是按模块名查 PLUGIN_ID_OFF_BY_MODULE 来的 */")
+    lines.append("#define %-22s %d" % ("PLUGIN_ID_OFF", id_off))
+    return "\n".join(lines) + "\n"
+
+
+def build_name_maps(enums):
+    # 值 -> 枚举名, 按枚举 tag 索引
+    return {tag: {value: name for name, value in pairs}
+            for tag, pairs in enums.items()}
+
+
+def build_frame_columns(enums):
+    """把 FRAME_PROPERTY_COLUMNS 落到这次运行的 DWARF 上, 返回 (列, 告警文本)。
+
+    每个列是 dict:
+        name   表头里的列名, 就是属性名
+        kind   "int"/"int64"/"enum"
+        cell   (数组, 索引), 数组是 "p32"/"p64"
+        tag    查名字用的枚举 tag, 只有 kind == "enum" 有
+        cats   适用帧类型的集合
+
+    列序 = 表里的行序(标了 x 的不进来) + DWARF 里多出来的属性(排在最后)。
+    """
+    arrays = (("p32", dict(enums["frame_property_e"])),
+              ("p64", dict(enums["frame_property64_e"])))
+    known = set(NOT_A_PROPERTY)
+    columns, warn = [], []
+
+    for name, kind, tag, cats in FRAME_PROPERTY_COLUMNS:
+        if name in known:
+            # 表是手写的, 同一个属性写两遍就会产出两个同名表头列, 而输出里看不出来
+            warn.append("表里 %s 写了不止一遍, 第二行(及以后)忽略" % name)
+            continue
+        known.add(name)
+        if cats == "x":
+            # 哪类帧都不显示: 不进输出, 留在表里只为把名字认下来, 免得被当成新属性
+            continue
+
+        hit = [(arr, table[name]) for arr, table in arrays if name in table]
+        if not hit:
+            #不在DWARF里的两个属性枚举里
+            continue
+
+        bad = set(cats) - set(CATEGORIES)
+        if bad:
+            warn.append("表中 %s 适用的帧类型是 %s, 里面有不认识的标志 %s "
+                        "(只认 %s 和 x), 忽略该未知标志"
+                        % (name, cats, CATEGORIES))
+        col = {"name": name, "kind": kind, "cell": hit[0],
+               "cats": set(cats) & set(CATEGORIES)}
+        if kind == "enum":
+            if tag in enums:
+                col["tag"] = tag
+            else:
+                # 留错了 tag 要报警: 不报的话这一列会一直打数字, 看着像"上游没设值"
+                warn.append("表中 %s 预按 %s 打枚举名, 但 DWARF 里没有这个类型, "
+                            "退化成打数字" % (name, tag))
+                col["kind"] = "int"
+        columns.append(col)
+
+    # 表里没有、DWARF 里有的属性 -> 所有帧类型都显示, 打数字。按属性索引排序, 顺序稳定。
+    extra = []
+    for arr, table in arrays:
+        for member in sorted(table, key=lambda m: (table[m], m)):
+            if member in known or member.startswith("MAX_FRAME_ELEMENT"):
+                continue
+            known.add(member)
+            extra.append((arr, member, table[member]))
+    for arr, member, index in extra:
+        columns.append({"name": member,
+                        "kind": "int64" if arr == "p64" else "int",
+                        "cell": (arr, index),
+                        "cats": set(CATEGORIES)})
+    if extra:
+        warn.append("DWARF 里出现了FRAME_PROPERTY_COLUMNS表里没有的帧属性: %s，"
+                    "为美化显示，考虑将其补充到表里"
+                    % ", ".join(m for _, m, _ in extra))
+
+    return columns, warn
+
+
+def build_type_categories(enums):
+    """帧类型数值 -> 类别字母。按**枚举名**对, 不按数值: 头文件里加一个类型, 数值整体
+    平移了也不会认错。不在 TYPE_CATEGORIES 里的类型(NONE/IMAGE/TEXT/INFO/STREAM_END,
+    以及头文件里将来新加的)走 UNKNOWN_CATEGORY。"""
+    by_name = dict(enums[TYPE_ENUM_TAG])
+    out = {}
+    for cat, names in TYPE_CATEGORIES:
+        for name in names:
+            if name in by_name:
+                out[by_name[name]] = cat
+    return out
+
+
+def build_header(columns):
+    return " ".join([HEADER_PREFIX] + [c["name"] for c in columns] + ["id"])
+
+
+def read_cell(event, cell):
+    arr, index = cell
+    return event.prop32[index] if arr == "p32" else event.prop64[index]
+
+
+def format_cell(col, event):
+    """按列的定义取值并排版。kind 决定怎么打, 和"这一帧是不是这类"无关 ——
+    那个判断在 print_event 里(不适用就打 "-")。"""
+    value = read_cell(event, col["cell"])
+    if col["kind"] == "enum":
+        return enum_name(name_maps[col["tag"]], value)
+    return value
+
+
+def enum_name(value_map, value):
+    """查不到就写 UNKNOWN(v): 沿用 gdb_pretty_printer_AntaresFrame.py 的约定,
+    无空格, 不破坏"列之间用空格分隔"的结构, awk 依然可用。"""
+    name = value_map.get(value)
+    return name if name is not None else "UNKNOWN(%s)" % value
+
+
+def plugin_modules():
+    """Plugins/ 下所有模块名(插件文件名去掉 .apf.<版本>), 仅用于报错时给候选建议。"""
+    mods = []
+    for path in glob.glob(PLUGIN_GLOB):
+        name = os.path.basename(path)
+        if ".apf." in name:
+            mods.append(name.split(".apf.")[0])
+    return sorted(set(mods))
+
+
+def suggest(typo, candidates):
+    """拼错的模块名/函数名给一行候选, 免得用户去 ls Plugins/ 一个个对。"""
+    close = difflib.get_close_matches(typo, candidates, n=5, cutoff=0.6)
+    if close:
+        return "\n  你是不是想传: %s" % ", ".join(close)
+    return ""
+
+
+def find_frame_symbol(plugin, module):
+    """在插件自己的符号表里找源码级名字等于 '<模块名>_frame' 的那个函数,
+    返回挂 probe 用的 mangled 名(实测 bcc 的 sym_re 匹配的是 ELF 里的 mangled 名)。
+
+    Itanium ABI 下 mangled 形如 _Z<长度><名字><签名>, static 再多一个 L;
+    C 编译出来的插件则是裸名。按长度前缀取名字比对、签名原样保留 —— 这样
+    不依赖具体签名(实测 57 个插件全是 PvS_, 但换个签名这里依然成立),
+    也不需要解名工具。
+
+    只做**精确**匹配, 不做子串: 同插件里 ts_muxer_info_frame / ts_muxer_obj_frame
+    这类同样以 <模块名> 开头的干扰符号极多(ts_muxer 里有 6 个以 _frame 结尾的),
+    子串匹配会挂错函数。"""
+    func = module + FRAME_SUFFIX
+    base = os.path.basename(plugin)
+    try:
+        proc = subprocess.Popen(["nm", "--defined-only", plugin],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, _ = proc.communicate()
+    except OSError as exc:
+        die("需要 nm (binutils) 来在插件里定位符号: %s" % exc)
+
+    hits = []
+    for line in to_text(out).splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[1] not in "TtWw":
+            continue
+        symbol = parts[2].split("@")[0]        # 去掉 sym@@VER 的版本后缀
+        if symbol == func:                     # C 插件: 裸名
+            hits.append(symbol)
+            continue
+        match = re.match(r"^_ZL?(\d+)", symbol)
+        if match is None:
+            continue
+        size = int(match.group(1))
+        body = symbol[match.end():]
+        if len(body) >= size and body[:size] == func:
+            hits.append(symbol)
+
+    if not hits:
+        die("Plugins/%s 的符号表里没有 '%s' —— 这个插件没遵守 <模块名>_frame 约定,\n"
+            "  或者它不是 C/C++ 编出来的帧处理函数。\n"
+            "  用 'nm --defined-only Plugins/%s | grep _frame' 看它有什么。"
+            % (base, func, base))
+    if len(hits) > 1:
+        die("Plugins/%s 里有 %d 个 '%s', 无法确定挂哪个:\n%s"
+            % (base, len(hits), func,
+               "\n".join("    " + h for h in sorted(hits))))
+    return hits[0]
+
+
+def plugin_id_off(module):
+    """由模块名查组件 id 句柄的偏移, 返回 (偏移, 出处说明)。
+
+    出处说明只用于 stderr 那个布局块 —— 表里命中的和吃默认值的要能一眼分开:
+    前者是查过的, 后者是"没查过这个组件, 按多数情况猜的"。"""
+    if module in PLUGIN_ID_OFF_BY_MODULE:
+        return PLUGIN_ID_OFF_BY_MODULE[module], "%s.apf 查表" % module
+    return PLUGIN_ID_OFF_DEFAULT, "%s.apf 查表" % module
+
+
+def resolve_plugin(func):
+    """由 --func 定位插件, 返回 (插件路径, mangled 符号名, 模块名)。
+
+    命名约定(实测 57/57 成立): 各插件的帧处理函数都叫 <模块名>_frame, 插件文件
+    叫 <模块名>.apf.<版本>。所以 --func 本身就唯一确定了插件 —— 不去别的插件里
+    找, 也正因如此 --func 只能是字面函数名, 不能是正则(正则推不出模块名)。
+
+    模块名也一并交出去: 它同时是查 PLUGIN_ID_OFF_BY_MODULE 的键, 调用方别再从
+    func 里切一次。
+
+    这也让错误更早、更准: 'ff_demuxer_frame' 只会去看 ff_demuxer.apf.*,
+    不会像以前那样扫 57 个插件的 12 万个符号然后报"匹配到 393 个"。"""
+    if not func.endswith(FRAME_SUFFIX) or func == FRAME_SUFFIX:
+        die("--func 必须形如 <模块名>_frame, 由 '%s' 推不出模块名。%s"
+            % (func, suggest(func, [m + FRAME_SUFFIX for m in plugin_modules()])
+               or "\n  它得是某个插件的帧处理函数本身, 比如 ff_demuxer_frame。"))
+
+    module = func[:-len(FRAME_SUFFIX)]
+    hits = sorted(glob.glob(os.path.join(SCRIPT_DIR, "Plugins", module + ".apf.*")))
+    if not hits:
+        # 候选也要给成 --func 能直接用的形态(带 _frame), 不然给了 'ts_muxer' 也没法用
+        die("Plugins/ 下没有 '%s.apf.*' —— 由 --func '%s' 推出的模块名是 '%s'。%s"
+            % (module, func, module,
+               suggest(module, [m + FRAME_SUFFIX for m in plugin_modules()])
+               or "\n  用 ls Plugins/ 看一眼有哪些插件。"))
+    if len(hits) > 1:
+        die("Plugins/ 下有 %d 个 '%s.apf.*', 无法确定用哪个:\n%s\n"
+            "  同一个模块只留一个版本再跑。"
+            % (len(hits), module,
+               "\n".join("    " + os.path.basename(h) for h in hits)))
+
+    plugin = hits[0]
+    symbol = find_frame_symbol(plugin, module)
+    sys.stderr.write("--func '%s' -> Plugins/%s  (符号 %s)\n"
+                     % (func, os.path.basename(plugin), symbol))
+    return plugin, symbol, module
+
+
+def ere_quote(text):
+    return "".join("\\" + c if c in ERE_META else c for c in text)
+
+
+parser = argparse.ArgumentParser(description="xtrace",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=examples)
+
+parser.add_argument("-f", "--func", required=True,
+                    help="帧处理函数名, 必须形如 <模块名>_frame(如 ff_demuxer_frame)。"
+                         "工具由它推出 Plugins/<模块名>.apf.* 并在其中找精确同名符号, "
+                         "所以只能是字面名、不能写正则, 也不必写 mangled 名")
+parser.add_argument("-i", "--id", default=None,
+                    help="组件 ID, 精确匹配 Antares_plugin_id_handle->id; 不设置则捕获所有组件")
+parser.add_argument("-r", "--ret", type=int, default=0,
+                    help="hook 函数返回值(返回值同样是帧链), 默认 0 = hook 入口")
+
+args = parser.parse_args()
+
+# 枚举表和帧结构偏移都只有一处来源, 每次运行都重新读一遍(0.2s,
+# 不做缓存 —— 缓存换来的是"陈旧布局"这个新失败面)。
+# 读到的枚举表写进 xtrace.enum 供事后对拍。
+source_desc = find_antares_lib()
+enums, layout = extract_dwarf(source_desc)
+check_required_enums(enums, source_desc)
+write_enum_dump(enums, ENUM_DUMP_PATH, source_desc)
+check_layout(layout, enums, source_desc)
+
+# 先定位插件再打布局块 —— 组件 id 的偏移按模块名查表, 不先知道模块名就没法填那一行。
+plugin_path, symbol, module = resolve_plugin(args.func)
+id_off, id_src = plugin_id_off(module)
+
+# 把读到的布局打出来: 换一份 libAntares 就会显示另一组偏移, 一眼能看出是不是换了修订。
+sys.stderr.write(format_layout(layout, enums, source_desc, id_off, id_src) + "\n")
+
+name_maps = build_name_maps(enums)
+frame_columns, column_warns = build_frame_columns(enums)
+frame_categories = build_type_categories(enums)
+
+for text in column_warns:
+    sys.stderr.write("WARNING: " + text + "\n")
+sys.stderr.flush()
+
+# 编译期开关和帧结构偏移都用前置 #define 注入, 不用占位符替换: 漏替换会让 C 编译不过。
+# EMIT_ON_ENTER 为 0 时入口 probe 只缓存 hdl 不提交事件。
+bpf_text = ("#define EMIT_ON_ENTER %d\n"
+            "#define MAX_FRAMES_PER_CALL %d\n"
+            % (0 if args.ret else 1, MAX_FRAMES_PER_CALL)
+            + build_layout_defines(layout, id_off) + bpf_text)
+
+b = BPF(text=bpf_text, cflags=["-fno-jump-tables", "-fno-asynchronous-unwind-tables"])
+
+# 入口 probe 恒挂(--ret 1 时它负责缓存 hdl); --ret 1 再挂出口 probe
+b.attach_uprobe(name=plugin_path, sym_re="^" + ere_quote(symbol) + "$",
+                fn_name="handle_list_enter", pid=-1)
+if args.ret == 1:
+    b.attach_uretprobe(name=plugin_path, sym_re="^" + ere_quote(symbol) + "$",
+                       fn_name="handle_list_exit", pid=-1)
+
+matched = b.num_open_uprobes()
+expected = 2 if args.ret == 1 else 1
+if matched == 0:
+    # nm 里看得见、bcc 却挂不上: 说明 bcc 不认这个符号(比如它只扫 .dynsym,
+    # 而 static 局部符号只在 .symtab)。
+    sys.stderr.write("error: 在 %s 上挂 probe 失败 —— nm 找得到符号 %s, "
+                     "bcc 却一个都没挂上\n" % (plugin_path, symbol))
+    sys.exit(1)
+elif matched > expected:
+    # 理论上不可能: 上面已经用 ^符号$ 精确锚定了。真出现说明 bcc 的匹配语义
+    # 不是整串匹配(重复挂载会让同一次调用被打印多次, 开销也翻倍)。
+    sys.stderr.write("WARNING: 实际挂载 %d 个 probe, 预期 %d 个。\n"
+                     "  已按 '^%s$' 精确匹配, 仍多挂上说明这个 bcc 版本的 sym_re "
+                     "语义和预期不同, 结果里可能有重复行。\n"
+                     % (matched, expected, symbol))
+
+
+# --id 过滤放在 Python 侧: BPF 里做字符串比较在 4096 指令预算下不划算。
+# 代价是未命中的事件也会走 perf buffer, 所以页数要开大一点。
+# 命中/未命中只在退出时统计一次(report_stats), 过程中不打扰。
+stats = {
+    "printed": 0,
+    "lost": 0,
+    "id_hit": 0,
+    "id_miss": 0,
+    "qlen_warned": False,
+}
+
+
+def get_plugin_id(event):
+    """取组件 ID。event.id 是 ctypes 的定长字符数组, 直接 str() 会得到
+    "b'...'" 或 ctypes 自己的表示, 所以按字节取, 再在第一个 NUL 处截断。"""
+    raw = event.id
+    if not isinstance(raw, (bytes, str)):
+        try:
+            raw = bytes(memoryview(raw))
+        except TypeError:
+            # 兜底: 认不出来的类型退回 str, 至少不要在这里抛异常
+            raw = str(raw)
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    return raw.split("\x00")[0]
+
+
+def print_event(event):
+    # 列是**定宽**的: 按 FRAME_PROPERTY_COLUMNS 全量排一遍, 对当前帧类型不适用的那一列
+    # 打 "-", 而不是把这一格省掉。一个 demuxer 的帧链上视频/音频/字幕帧是混着的,
+    # 行宽随类型伸缩的话日志就没法对齐着看, awk 的列号也不稳定。
+    #
+    # prop32 在 BPF 侧是 s32, 所以插件设的 -1 会原样打成 -1, 不会被截成 4294967295
+    # (str() 是有符号的)。
+    cat = frame_categories.get(event.type, UNKNOWN_CATEGORY)
+    row = [
+        "enter" if event.enter else "exit",
+        event.timestamp,
+        event.process_id,
+        event.tid,
+        event.qlen,
+        enum_name(name_maps[TYPE_ENUM_TAG], event.type),
+        event.data_size,
+    ]
+    for col in frame_columns:
+        row.append(format_cell(col, event) if cat in col["cats"] else "-")
+    row.append(get_plugin_id(event))
+    sys.stdout.write(" ".join(str(v) for v in row) + "\n")
+    # 重定向到文件时 stdout 是全缓冲的, 不 flush 的话 Ctrl-C 会丢掉最后一段
+    sys.stdout.flush()
+
+
+def warn_qlen(event):
+    stats["qlen_warned"] = True
+    sys.stderr.write("WARNING: 有帧链长度 %d 超过上限 %d, 只记录了前 %d 帧"
+                     "(qlen 列是链的真实长度)\n"
+                     % (event.qlen, MAX_FRAMES_PER_CALL, MAX_FRAMES_PER_CALL))
+    sys.stderr.flush()
+
+
+def cb(cpu, data, size):
+    event = b["events"].event(data)
+
+    if args.id is not None:
+        if get_plugin_id(event) != args.id:
+            stats["id_miss"] += 1
+            return
+        stats["id_hit"] += 1
+
+    if event.qlen > MAX_FRAMES_PER_CALL and not stats["qlen_warned"]:
+        warn_qlen(event)
+
+    stats["printed"] += 1
+    print_event(event)
+
+
+def lost_cb(*args):
+    # 静默丢事件是这个工具最坏的失败模式, 一定要让用户看到。
+    # 不同 bcc 版本这个回调的参数不一样(有的是丢弃计数, 有的是 cpu + 丢弃计数),
+    # 取最后一个整数参数; 认不出来就按 1 条计。
+    lost = 1
+    for arg in reversed(args):
+        if isinstance(arg, int) and not isinstance(arg, bool):
+            lost = arg
+            break
+    stats["lost"] += lost
+
+
+def report_stats():
+    """退出时打一次。--id 的过滤结果**只在这里体现**, 过程中不告警 ——
+    命中 0 条时这个数就是判断 ID 写错/偏移不对的依据。"""
+    sys.stdout.flush()
+    msg = ""
+    if stats["lost"] > 0:
+        msg += ("丢掉了 %d 条事件(perf buffer 溢出), 结果不完整\n" % stats["lost"])
+    if args.id is not None:
+        msg += ("--id %s: 命中 %d 条, 未命中 %d 条\n"
+                % (args.id, stats["id_hit"], stats["id_miss"]))
+    if msg:
+        sys.stderr.write(msg)
+        sys.stderr.flush()
+
+
+def on_signal(signum, frame):
+    report_stats()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, on_signal)
+signal.signal(signal.SIGTERM, on_signal)
+
+b["events"].open_perf_buffer(cb, page_cnt=64, lost_cb=lost_cb)
+
+print(build_header(frame_columns))
+sys.stdout.flush()
+
+while True:
+    b.perf_buffer_poll()
