@@ -564,7 +564,8 @@ def enum_tags():
             names.append(col[2])
     return names
 
-GDB_DWARF_SCRIPT = '''import gdb, json
+GDB_DWARF_SCRIPT = '''# -*- coding: utf-8 -*-
+import gdb, json
 
 SO = %(so)s
 TAGS = %(tags)s
